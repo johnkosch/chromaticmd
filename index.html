@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chromatic Melodies</title>
+<script src="https://www.verovio.org/javascript/latest/verovio-toolkit-wasm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.min.js"></script>
+<style>
+  :root { color-scheme: light; --ink:#172033; --muted:#5b6474; --line:#d8deea; --panel:#f6f8fb; --accent:#2458a6; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:28px 16px 44px; font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:#fff; }
+  main { max-width:900px; margin:0 auto; }
+  h1 { font-size:clamp(1.7rem,4vw,2.2rem); margin:0 0 8px; }
+  .intro { margin:0 0 24px; color:var(--muted); line-height:1.5; }
+  .panel { border:1px solid var(--line); border-radius:16px; padding:20px; background:var(--panel); }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  button { appearance:none; border:1px solid #b8c3d6; border-radius:9px; padding:11px 16px; font:inherit; font-weight:650; cursor:pointer; background:#fff; color:var(--ink); min-height:44px; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  button:focus-visible { outline:3px solid #91b8f5; outline-offset:2px; }
+  .status { min-height:1.5em; margin:14px 0 0; color:var(--muted); font-size:.95rem; }
+  .tip { margin:16px 0 0; color:var(--muted); font-size:.9rem; line-height:1.45; }
+  #notationPanel { margin-top:20px; padding:14px 14px 10px; border:1px solid var(--line); border-radius:14px; background:#fff; }
+  #setupNotation, #notation { width:100%; overflow-x:auto; }
+  #setupNotation svg, #notation svg { display:block; width:100%; height:auto; }
+  #setupNotation[hidden], #notation[hidden] { display:none; }
+  .section-title { font-size:1.1rem; margin:0 0 12px; }
+  @media (max-width:520px) { body { padding:20px 12px 32px; } .panel { padding:16px; } .controls { display:grid; grid-template-columns:1fr; } button { width:100%; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Chromatic Melodies</h1>
+  <p class="intro">Dictate the four-measure melody.</p>
+  <section class="panel" aria-label="Melody controls">
+    <div class="controls">
+      <button id="generateButton" class="primary" disabled>Generate New Melody</button>
+      <button id="playButton" disabled>Play Melody</button>
+      <button id="revealButton" disabled>Reveal Notation</button>
+    </div>
+    <p id="status" class="status" role="status" aria-live="polite">Loading notation engine…</p>
+  </section>
+  <section id="notationPanel" aria-label="Exercise notation">
+    <div id="setupNotation" aria-label="Key signature, time signature, measure count, and first note"></div>
+    <div id="notation" hidden aria-label="Complete melody notation"></div>
+  </section>
+</main>
+<script>
+(() => {
+  "use strict";
+  let toolkit = null;
+  let melody = [];
+  let currentKey = "C";
+  let clefMode = "treble";
+  let config = null;
+  let audioContext = null;
+  let piano = null;
+  let pianoPromise = null;
+  let isPlaying = false;
+  let playbackToken = 0;
+  const TEMPO = 88;
+  const BEAT_SECONDS = 60 / TEMPO;
+  const statusEl = document.getElementById("status");
+  const setupNotationEl = document.getElementById("setupNotation");
+  const generateButton = document.getElementById("generateButton");
+  const playButton = document.getElementById("playButton");
+  const revealButton = document.getElementById("revealButton");
+  const notationPanel = document.getElementById("notationPanel");
+  const notationEl = document.getElementById("notation");
+
+  function randomChoice(array) { return array[Math.floor(Math.random() * array.length)]; }
+
+  const keyConfigs = {
+  F: {
+    name: "F major",
+    tonic: "f4",
+    tonicChoices: ["f4", "a4", "c5"],
+    keySig: "1f",
+    chords: [
+      ["f4", "a4", "c5", "f5"],
+      ["bb4", "d5", "f5"],
+      ["c5", "e5", "g5"],
+      ["f4", "a4", "c5", "f5"]
+    ],
+    pitchNumbers: {
+      "f4": 0, "f#4": 0.5, "g4": 1, "g#4": 1.5, "a4": 2,
+      "bb4": 3, "b4": 3.5, "c5": 4, "c#5": 4.5, "d5": 5,
+      "d#5": 5.5, "e5": 6, "f5": 7, "f#5": 7.5, "g5": 8
+    },
+    diatonicNumbers: {
+      "f4": 0, "g4": 1, "a4": 2, "bb4": 3, "c5": 4,
+      "d5": 5, "e5": 6, "f5": 7, "g5": 8
+    },
+    pitchNames: ["f4", "g4", "a4", "bb4", "c5", "d5", "e5", "f5", "g5"],
+    chromaticAscending: {
+      "f4-g4": "f#4", "g4-a4": "g#4", "a4-bb4": null,
+      "bb4-c5": "b4", "c5-d5": "c#5", "d5-e5": "d#5", "e5-f5": null
+    },
+    chromaticDescending: {
+      "g4-f4": "gb4", "a4-g4": "ab4", "bb4-a4": null,
+      "c5-bb4": "b4", "d5-c5": "db5", "e5-d5": "eb5", "f5-e5": null
+    }
+  },
+  Bb: {
+    name: "B-flat major",
+    tonic: "bb4",
+    tonicChoices: ["bb4", "d5", "f5"],
+    keySig: "2f",
+    chords: [
+      ["bb4", "d5", "f5", "bb5"],
+      ["eb5", "g5", "bb5"],
+      ["f5", "a5", "c6"],
+      ["bb4", "d5", "f5", "bb5"]
+    ],
+    diatonicNumbers: {
+      "bb4": 0, "c5": 1, "d5": 2, "eb5": 3,
+      "f5": 4, "g5": 5, "a5": 6, "bb5": 7, "c6": 8
+    },
+    pitchNames: [
+      "bb4", "c5", "d5", "eb5", "f5", "g5", "a5", "bb5", "c6"
+    ],
+    chromaticAscending: {
+      "bb4-c5": "b4",
+      "c5-d5": "c#5",
+      "d5-eb5": null,
+      "eb5-f5": "e5",
+      "f5-g5": "f#5",
+      "g5-a5": "g#5",
+      "a5-bb5": null,
+      "bb5-c6": "b5"
+    },
+    chromaticDescending: {
+      "c5-bb4": "b4",
+      "d5-c5": "db5",
+      "eb5-d5": null,
+      "f5-eb5": "e5",
+      "g5-f5": "gb5",
+      "a5-g5": "ab5",
+      "bb5-a5": null,
+      "c6-bb5": "b5"
+    }
+  },
+  Eb: {
+    name: "E-flat major",
+    tonic: "eb4",
+    tonicChoices: ["eb4", "g4", "bb4"],
+    keySig: "3f",
+    chords: [
+      ["eb4", "g4", "bb4", "eb5"],
+      ["ab4", "c5", "eb5"],
+      ["bb4", "d5", "f5"],
+      ["eb4", "g4", "bb4", "eb5"]
+    ],
+    diatonicNumbers: {
+      "eb4": 0, "f4": 1, "g4": 2, "ab4": 3,
+      "bb4": 4, "c5": 5, "d5": 6, "eb5": 7, "f5": 8
+    },
+    pitchNames: [
+      "eb4", "f4", "g4", "ab4", "bb4", "c5", "d5", "eb5", "f5"
+    ],
+    chromaticAscending: {
+      "eb4-f4": "e4",
+      "f4-g4": "f#4",
+      "g4-ab4": null,
+      "ab4-bb4": "a4",
+      "bb4-c5": "b4",
+      "c5-d5": "c#5",
+      "d5-eb5": null,
+      "eb5-f5": "e5"
+    },
+    chromaticDescending: {
+      "f4-eb4": "e4",
+      "g4-f4": "gb4",
+      "ab4-g4": null,
+      "bb4-ab4": "a4",
+      "c5-bb4": "b4",
+      "d5-c5": "db5",
+      "eb5-d5": null,
+      "f5-eb5": "e5"
+    }
+  },
+  G: {
+    name: "G major",
+    tonic: "g4",
+    tonicChoices: ["g4", "b4", "d5"],
+    keySig: "1s",
+    chords: [
+      ["g4", "b4", "d5", "g5"],
+      ["c5", "e5", "g5"],
+      ["d5", "f#5", "a5"],
+      ["g4", "b4", "d5", "g5"]
+    ],
+    diatonicNumbers: {
+      "g4": 0, "a4": 1, "b4": 2, "c5": 3,
+      "d5": 4, "e5": 5, "f#5": 6, "g5": 7, "a5": 8
+    },
+    pitchNames: [
+      "g4", "a4", "b4", "c5", "d5", "e5", "f#5", "g5", "a5"
+    ],
+    chromaticAscending: {
+      "g4-a4": "g#4",
+      "a4-b4": "a#4",
+      "b4-c5": null,
+      "c5-d5": "c#5",
+      "d5-e5": "d#5",
+      "e5-f#5": "e#5",
+      "f#5-g5": null,
+      "g5-a5": "g#5"
+    },
+    chromaticDescending: {
+      "a4-g4": "ab4",
+      "b4-a4": "bb4",
+      "c5-b4": null,
+      "d5-c5": "db5",
+      "e5-d5": "eb5",
+      "f#5-e5": "f5",
+      "g5-f#5": null,
+      "a5-g5": "ab5"
+    }
+  },
+  D: {
+    name: "D major",
+    tonic: "d4",
+    tonicChoices: ["d4", "f#4", "a4"],
+    keySig: "2s",
+    chords: [
+      ["d4", "f#4", "a4", "d5"],
+      ["g4", "b4", "d5"],
+      ["a4", "c#5", "e5"],
+      ["d4", "f#4", "a4", "d5"]
+    ],
+    diatonicNumbers: {
+      "d4": 0, "e4": 1, "f#4": 2, "g4": 3,
+      "a4": 4, "b4": 5, "c#5": 6, "d5": 7, "e5": 8
+    },
+    pitchNames: [
+      "d4", "e4", "f#4", "g4", "a4", "b4", "c#5", "d5", "e5"
+    ],
+    chromaticAscending: {
+      "d4-e4": "d#4",
+      "e4-f#4": "e#4",
+      "f#4-g4": null,
+      "g4-a4": "g#4",
+      "a4-b4": "a#4",
+      "b4-c#5": "b#4",
+      "c#5-d5": null,
+      "d5-e5": "d#5"
+    },
+    chromaticDescending: {
+      "e4-d4": "eb4",
+      "f#4-e4": "f4",
+      "g4-f#4": null,
+      "a4-g4": "ab4",
+      "b4-a4": "bb4",
+      "c#5-b4": "c5",
+      "d5-c#5": null,
+      "e5-d5": "eb5"
+    }
+  },
+  A: {
+    name: "A major",
+    tonic: "a4",
+    tonicChoices: ["a4", "c#5", "e5"],
+    keySig: "3s",
+    chords: [
+      ["a4", "c#5", "e5", "a5"],
+      ["d5", "f#5", "a5"],
+      ["e5", "g#5", "b5"],
+      ["a4", "c#5", "e5", "a5"]
+    ],
+    diatonicNumbers: {
+      "a4": 0, "b4": 1, "c#5": 2, "d5": 3,
+      "e5": 4, "f#5": 5, "g#5": 6, "a5": 7, "b5": 8
+    },
+    pitchNames: [
+      "a4", "b4", "c#5", "d5", "e5", "f#5", "g#5", "a5", "b5"
+    ],
+    chromaticAscending: {
+      "a4-b4": "a#4",
+      "b4-c#5": "b#4",
+      "c#5-d5": null,
+      "d5-e5": "d#5",
+      "e5-f#5": "e#5",
+      "f#5-g#5": "f##5",
+      "g#5-a5": null,
+      "a5-b5": "a#5"
+    },
+    chromaticDescending: {
+      "b4-a4": "bb4",
+      "c#5-b4": "c5",
+      "d5-c#5": null,
+      "e5-d5": "eb5",
+      "f#5-e5": "f5",
+      "g#5-f#5": "g5",
+      "a5-g#5": null,
+      "b5-a5": "bb5"
+    }
+  },
+  C: {
+    name: "C major",
+    tonic: "c4",
+    tonicChoices: ["c4", "e4", "g4"],
+    keySig: "0",
+    chords: [
+      ["c4", "e4", "g4", "c5"],
+      ["f4", "a4", "c5"],
+      ["g4", "b4", "d5"],
+      ["c4", "e4", "g4", "c5"]
+    ],
+    pitchNumbers: {
+      "c4": 0, "c#4": 0.5, "d4": 1, "d#4": 1.5, "eb4": 1.5, "e4": 2,
+      "f4": 3, "f#4": 3.5, "g4": 4, "g#4": 4.5, "ab4": 4.5, "a4": 5,
+      "a#4": 5.5, "bb4": 5.5, "b4": 6, "c5": 7, "c#5": 7.5, "d5": 8
+    },
+    diatonicNumbers: {
+      "c4": 0, "d4": 1, "e4": 2, "f4": 3, "g4": 4, "a4": 5,
+      "b4": 6, "c5": 7, "d5": 8
+    },
+    pitchNames: ["c4", "d4", "e4", "f4", "g4", "a4", "b4", "c5", "d5"],
+    chromaticAscending: {
+      "c4-d4": "c#4", "d4-e4": "d#4", "e4-f4": null,
+      "f4-g4": "f#4", "g4-a4": "g#4", "a4-b4": "a#4",
+      "b4-c5": null, "c5-d5": "c#5"
+    },
+    chromaticDescending: {
+      "d4-c4": "db4", "e4-d4": "eb4", "f4-e4": null,
+      "g4-f4": "gb4", "a4-g4": "ab4", "b4-a4": "bb4",
+      "c5-b4": null, "d5-c5": "db5"
+    }
+  }
+};
+
+  // One key is selected for each exercise, as in the Decorative Chromaticism source.
+  const availableKeys = ["F", "C", "G", "Bb", "Eb", "D", "A"];
+
+  const rhythmCells = [
+    { weight: 5, notes: [{ type: "note", beats: 2, meiDur: 2 }] },
+    { weight: 7, notes: [{ type: "note", beats: 1, meiDur: 4 }, { type: "note", beats: 1, meiDur: 4 }] },
+    { weight: 2, notes: [{ type: "rest", beats: 1, meiDur: 4 }, { type: "note", beats: 1, meiDur: 4 }] }
+  ];
+
+  function randomRhythmCell(excludedCell = null) {
+    const available = rhythmCells.filter(cell => cell !== excludedCell);
+    const totalWeight = available.reduce((sum, cell) => sum + cell.weight, 0);
+    let random = Math.random() * totalWeight;
+    for (const cell of available) {
+      random -= cell.weight;
+      if (random <= 0) return { source: cell, notes: cell.notes.map(note => ({ ...note })) };
+    }
+    const fallback = available[0];
+    return { source: fallback, notes: fallback.notes.map(note => ({ ...note })) };
+  }
+
+  function diatonicNumber(pitch) { return config.diatonicNumbers[pitch]; }
+  function pitchFromDiatonicNumber(number) { return config.pitchNames[number]; }
+  function chromaticBetween(a, b) {
+    const aNum = diatonicNumber(a), bNum = diatonicNumber(b);
+    if (aNum === undefined || bNum === undefined || Math.abs(aNum - bNum) !== 1) return null;
+    const key = a + "-" + b;
+    return aNum < bNum ? (config.chromaticAscending[key] || null) : (config.chromaticDescending[key] || null);
+  }
+
+  // Source algorithm: chord-tone skeleton, randomized legal candidate order, and a tonic resolution.
+  function generatePitches(measures) {
+    const soundingEvents = [];
+    measures.forEach((measure, measureIndex) => {
+      for (const event of measure) if (event.type === "note") soundingEvents.push({ event, chord: config.chords[measureIndex] });
+    });
+    const degree = pitch => diatonicNumber(pitch);
+    function candidatesFor(current, chord) {
+      return chord.filter(candidate => {
+        const distance = Math.abs(degree(candidate) - degree(current));
+        if (distance > 3) return false;
+        if ((degree(current) === 6 && degree(candidate) === 3) || (degree(current) === 3 && degree(candidate) === 6)) return false;
+        if (distance === 5 || distance === 6) return false;
+        return true;
+      });
+    }
+    const result = new Array(soundingEvents.length);
+    function search(position, current) {
+      if (position === soundingEvents.length - 1) {
+        const final = config.tonic;
+        if (Math.abs(degree(current) - degree(final)) <= 3) { result[position] = final; return true; }
+        return false;
+      }
+      if (position === 0) {
+        const start = randomChoice(config.tonicChoices);
+        result[0] = start;
+        return search(1, start);
+      }
+      let candidates = candidatesFor(current, soundingEvents[position].chord);
+      candidates = candidates.sort(() => Math.random() - 0.5);
+      for (const candidate of candidates) {
+        result[position] = candidate;
+        if (search(position + 1, candidate)) return true;
+      }
+      return false;
+    }
+    for (let attempt = 0; attempt < 200; attempt++) {
+      result.fill(null);
+      if (search(0, config.tonic)) {
+        soundingEvents.forEach((item, i) => { item.event.pitch = result[i]; });
+        return;
+      }
+    }
+    throw new Error("Could not find a valid chord-tone skeleton.");
+  }
+
+  // Decorative chromaticism: replace the repeated middle pitch in a repeated-note/step pattern.
+  function addChromaticPassingTones(measures) {
+    const sounding = [];
+    for (const measure of measures) for (const event of measure) if (event.type === "note") sounding.push(event);
+    for (let i = 0; i < sounding.length - 2; i++) {
+      const first = sounding[i], middle = sounding[i + 1], third = sounding[i + 2];
+      if (first.pitch === middle.pitch && diatonicNumber(first.pitch) !== undefined && diatonicNumber(third.pitch) !== undefined) {
+        const passing = chromaticBetween(first.pitch, third.pitch);
+        if (passing) { middle.pitch = passing; middle.isChromaticPassing = true; }
+      }
+    }
+  }
+
+  // Diatonic passing tones between quarter-note chord tones a third apart.
+  function fillThirdsWithPassingTones(measures) {
+    for (const measure of measures) {
+      const result = [];
+      for (let i = 0; i < measure.length; i++) {
+        const current = measure[i], next = measure[i + 1];
+        if (current.type === "note" && next && next.type === "note" && !current.isChromaticPassing && !next.isChromaticPassing && current.beats === 1 && next.beats === 1) {
+          const a = diatonicNumber(current.pitch), b = diatonicNumber(next.pitch);
+          if (Math.abs(a - b) === 2) {
+            const middle = pitchFromDiatonicNumber((a + b) / 2);
+            result.push({ type: "note", pitch: current.pitch, beats: 0.5, meiDur: 8 });
+            result.push({ type: "note", pitch: middle, beats: 0.5, meiDur: 8 });
+            result.push({ type: "note", pitch: next.pitch, beats: 1, meiDur: 4 });
+            i++;
+            continue;
+          }
+        }
+        result.push(current);
+      }
+      measure.length = 0;
+      measure.push(...result);
+    }
+  }
+
+  // Neighbor-tone figures for repeated quarter notes: eighth + eighth + quarter.
+  function addNeighborToRepeatedPitches(measures) {
+    for (const measure of measures) {
+      const result = [];
+      for (let i = 0; i < measure.length; i++) {
+        const current = measure[i], next = measure[i + 1];
+        if (current.type === "note" && next && next.type === "note" && current.pitch === next.pitch && current.beats === 1 && next.beats === 1) {
+          const number = diatonicNumber(current.pitch), choices = [];
+          if (number > 0) choices.push(number - 1);
+          if (number < config.pitchNames.length - 1) choices.push(number + 1);
+          const neighbor = pitchFromDiatonicNumber(randomChoice(choices));
+          result.push({ type: "note", pitch: current.pitch, beats: 0.5, meiDur: 8 });
+          result.push({ type: "note", pitch: neighbor, beats: 0.5, meiDur: 8 });
+          result.push({ type: "note", pitch: next.pitch, beats: 1, meiDur: 4 });
+          i++;
+          continue;
+        }
+        result.push(current);
+      }
+      measure.length = 0;
+      measure.push(...result);
+    }
+  }
+
+  // Retain the established rhythm rule: a quarter rest on beat 3 lengthens the previous note.
+  function absorbBeatThreeQuarterRests(measures) {
+    for (const measure of measures) {
+      let elapsedBeats = 0;
+      for (let i = 0; i < measure.length; i++) {
+        const event = measure[i];
+        if (event.type === "rest" && event.beats === 1 && elapsedBeats === 2 && i > 0) {
+          const previous = measure[i - 1];
+          if (previous.type === "note") {
+            previous.beats += 1;
+            if (previous.meiDur === 4) previous.meiDur = 2;
+            else if (previous.meiDur === 2) { previous.meiDur = 2; previous.dots = 1; }
+            else if (previous.meiDur === 1) { previous.meiDur = 1; previous.dots = 1; }
+            measure.splice(i, 1);
+            i--;
+            continue;
+          }
+        }
+        elapsedBeats += event.beats;
+      }
+    }
+  }
+
+  function createRandomMelody() {
+    currentKey = randomChoice(availableKeys);
+    config = keyConfigs[currentKey];
+    for (let attempt = 0; attempt < 500; attempt++) {
+      const measures = [];
+      let previousCell = null;
+      for (let measureNumber = 0; measureNumber < 4; measureNumber++) {
+        const firstChoice = randomRhythmCell(previousCell);
+        const firstCell = firstChoice.notes;
+        previousCell = firstChoice.source;
+        let secondCell;
+        if (measureNumber === 3) {
+          secondCell = [{ type: "note", beats: 2, meiDur: 2 }];
+        } else {
+          const secondChoice = randomRhythmCell(previousCell);
+          secondCell = secondChoice.notes;
+          previousCell = secondChoice.source;
+        }
+        measures.push([...firstCell, ...secondCell]);
+      }
+      generatePitches(measures);
+      addChromaticPassingTones(measures);
+      const hasChromaticism = measures.some(measure => measure.some(event => event.type === "note" && event.isChromaticPassing === true));
+      if (!hasChromaticism) continue;
+      absorbBeatThreeQuarterRests(measures);
+      fillThirdsWithPassingTones(measures);
+      addNeighborToRepeatedPitches(measures);
+      return measures;
+    }
+    throw new Error("Could not generate a melody containing chromaticism.");
+  }
+
+  function pitchToMidi(pitch) {
+    const match = /^([a-g])(#{1,2}|b{1,2})?(\d)$/.exec(pitch);
+    if (!match) throw new Error("Invalid pitch: " + pitch);
+    const semitones = { c:0, d:2, e:4, f:5, g:7, a:9, b:11 };
+    let midi = (Number(match[3]) + 1) * 12 + semitones[match[1]];
+    const accidental = match[2] || "";
+    if (accidental.startsWith("#")) midi += accidental.length;
+    if (accidental.startsWith("b")) midi -= accidental.length;
+    return midi;
+  }
+  function midiToSoundName(midi) {
+    const names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+    return names[((midi % 12) + 12) % 12] + (Math.floor(midi / 12) - 1);
+  }
+
+  function renderBar(bar) {
+    let output = "", i = 0;
+    while (i < bar.length) {
+      const current = bar[i], next = bar[i + 1];
+      const isEighth = event => event && event.type === "note" && event.meiDur === 8 && event.beats === 0.5;
+      if (isEighth(current) && isEighth(next)) { output += `<beam>${meiEvent(current)}${meiEvent(next)}</beam>`; i += 2; }
+      else { output += meiEvent(current); i++; }
+    }
+    return output;
+  }
+
+  function keyAccidentals() {
+    return currentKey === "G" ? { f: "#" } :
+      currentKey === "D" ? { f: "#", c: "#" } :
+      currentKey === "A" ? { f: "#", c: "#", g: "#" } :
+      currentKey === "F" ? { b: "b" } :
+      currentKey === "Bb" ? { b: "b", e: "b" } :
+      currentKey === "Eb" ? { b: "b", e: "b", a: "b" } : {};
+  }
+
+  function meiEvent(event) {
+    if (event.type === "rest") return `<rest dur="${event.meiDur}"/>`;
+    const match = /^([a-g])(#{1,2}|b{1,2})?(\d)$/.exec(event.pitch);
+    if (!match) throw new Error("Invalid pitch for notation: " + event.pitch);
+    const pname = match[1], written = match[2] || null, octave = match[3];
+    let accid = written;
+    const keyAcc = keyAccidentals();
+    if (Object.prototype.hasOwnProperty.call(keyAcc, pname)) {
+      if (written === keyAcc[pname]) accid = null;
+      else if (written === null) accid = "n";
+    }
+    const meiAccid = accid === "##" ? "ss" : accid === "#" ? "s" : accid === "bb" ? "ff" : accid === "b" ? "f" : accid === "n" ? "n" : "";
+    const accidental = meiAccid ? ` accid="${meiAccid}"` : "";
+    const dots = event.dots ? ` dots="${event.dots}"` : "";
+    return `<note pname="${pname}" oct="${octave}" dur="${event.meiDur}"${dots}${accidental}/>`;
+  }
+
+  function transposePitchByOctaves(pitch, octaveOffset) {
+    return pitch.replace(/(\d)$/, (_, octave) => String(Number(octave) + octaveOffset));
+  }
+  function melodyForCurrentClef() {
+    const octaveOffset = clefMode === "bass" ? -2 : 0;
+    return melody.map(bar => bar.map(event => {
+      if (event.type !== "note") return { ...event };
+      return { ...event, pitch: transposePitchByOctaves(event.pitch, octaveOffset) };
+    }));
+  }
+
+  function makeMEI(showSetup = false) {
+    const displayedMelody = melodyForCurrentClef();
+    const measures = displayedMelody.map((bar, i) => {
+      let contents = renderBar(bar);
+      if (showSetup && i === 0) {
+        contents = "";
+        for (const event of bar) {
+          contents += meiEvent(event);
+          if (event.type === "note") break;
+        }
+      } else if (showSetup) contents = "";
+      return `<measure n="${i + 1}"><staff n="1"><layer n="1">${contents}</layer></staff></measure>`;
+    }).join("\n");
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<mei xmlns="http://www.music-encoding.org/ns/mei" meiversion="5.0">
+  <music><body><mdiv><score>
+    <scoreDef meter.count="4" meter.unit="4" key.sig="${config.keySig}" key.mode="major">
+      <staffGrp><staffDef n="1" lines="5" clef.shape="${clefMode === "treble" ? "G" : "F"}" clef.line="${clefMode === "treble" ? "2" : "4"}"/></staffGrp>
+    </scoreDef>
+    <section>${measures}</section>
+  </score></mdiv></body></music>
+</mei>`;
+  }
+
+  function renderSetupNotation() {
+    const svg = toolkit.renderData(makeMEI(true), {});
+    if (!svg || !svg.includes("<svg")) throw new Error("Verovio did not return setup notation.");
+    setupNotationEl.innerHTML = svg;
+  }
+  function generateMelody() {
+    try {
+      melody = createRandomMelody();
+      clefMode = randomChoice(["treble", "bass"]);
+      renderSetupNotation();
+      notationPanel.hidden = false;
+      setupNotationEl.hidden = false;
+      notationEl.hidden = true;
+      notationEl.innerHTML = "";
+      revealButton.disabled = false;
+      playButton.disabled = false;
+      statusEl.textContent = "Press 'Play Melody' to listen.";
+      console.log("Generated decorative-chromaticism melody", { key: currentKey, melody });
+    } catch (error) {
+      statusEl.textContent = "Could not generate a melody. Please generate another exercise.";
+      console.error(error);
+    }
+  }
+
+  async function getPiano() {
+    if (piano) return piano;
+    if (pianoPromise) return pianoPromise;
+    if (!window.Soundfont) throw new Error("The piano audio library did not load. Check your internet connection and reload.");
+    audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+    pianoPromise = window.Soundfont.instrument(audioContext, "acoustic_grand_piano", { soundfont: "MusyngKite", format: "mp3", gain: 0.85 })
+      .then(instrument => { piano = instrument; return piano; })
+      .catch(error => { pianoPromise = null; throw error; });
+    return pianoPromise;
+  }
+  async function playMelody() {
+    if (!melody.length || isPlaying) return;
+    const thisToken = ++playbackToken;
+    isPlaying = true;
+    playButton.disabled = true;
+    generateButton.disabled = true;
+    statusEl.textContent = "Loading sampled piano…";
+    try {
+      const instrument = await getPiano();
+      if (thisToken !== playbackToken) return;
+      await audioContext.resume();
+      statusEl.textContent = "Playing melody…";
+      const startAt = audioContext.currentTime + 0.12;
+      let offsetBeats = 0;
+      melodyForCurrentClef().flat().forEach(event => {
+        const start = startAt + offsetBeats * BEAT_SECONDS;
+        const duration = Math.max(0.10, event.beats * BEAT_SECONDS * 0.84);
+        if (event.type === "note") {
+          const voice = instrument.play(midiToSoundName(pitchToMidi(event.pitch)), start, duration, { gain: 0.72 });
+          if (voice && voice.gain && voice.gain.setValueAtTime) {
+            voice.gain.setValueAtTime(0.72, start);
+            voice.gain.setValueAtTime(0.72, Math.max(start, start + duration - 0.055));
+            voice.gain.linearRampToValueAtTime(0.0001, start + duration);
+          }
+          if (voice && typeof voice.stop === "function") { try { voice.stop(start + duration); } catch (_) {} }
+        }
+        offsetBeats += event.beats;
+      });
+      window.setTimeout(() => {
+        if (thisToken !== playbackToken) return;
+        isPlaying = false;
+        playButton.disabled = false;
+        generateButton.disabled = false;
+        statusEl.textContent = "Playback finished. You can listen again or reveal the notation.";
+      }, offsetBeats * BEAT_SECONDS * 1000 + 300);
+    } catch (error) {
+      isPlaying = false;
+      playButton.disabled = false;
+      generateButton.disabled = false;
+      statusEl.textContent = "Audio could not be loaded. Check your internet connection and try Play Melody again.";
+      console.error(error);
+    }
+  }
+  function revealNotation() {
+    if (!toolkit || !melody.length) return;
+    try {
+      const svg = toolkit.renderData(makeMEI(false), {});
+      if (!svg || !svg.includes("<svg")) throw new Error("Verovio did not return a score.");
+      notationEl.innerHTML = svg;
+      setupNotationEl.hidden = true;
+      notationEl.hidden = false;
+      notationPanel.hidden = false;
+      statusEl.textContent = "Notation revealed. Generate a new melody when you are ready for another exercise.";
+    } catch (error) {
+      statusEl.textContent = "Could not render the notation. Please reload the app and try again.";
+      console.error(error);
+    }
+  }
+  generateButton.addEventListener("click", () => { if (!isPlaying) generateMelody(); });
+  playButton.addEventListener("click", playMelody);
+  revealButton.addEventListener("click", revealNotation);
+
+  function initializeVerovio() {
+    try {
+      toolkit = new verovio.toolkit();
+      toolkit.setOptions({ scale: 42, adjustPageWidth: true, pageMarginTop: 35, pageMarginBottom: 35, pageMarginLeft: 35, pageMarginRight: 35, breaks: "auto" });
+      generateButton.disabled = false;
+      generateMelody();
+    } catch (error) {
+      statusEl.textContent = "The notation engine could not start. Check your internet connection and reload.";
+      console.error(error);
+    }
+  }
+  if (window.verovio && window.verovio.module) window.verovio.module.onRuntimeInitialized = initializeVerovio;
+  else statusEl.textContent = "Could not load the notation engine. Check your internet connection and reload.";
+})();
+</script>
+</body>
+</html>
